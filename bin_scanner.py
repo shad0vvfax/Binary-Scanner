@@ -453,10 +453,13 @@ def main():
         print(f"Error: File '{args.file}' not found", file=sys.stderr)
         sys.exit(1)
     
-    print(f"Scanning: {file_path}")
-    file_hash = calculate_file_hash(file_path)
-    print(f"sha256 file hash: {file_hash}")
-    print(f"File size: {file_path.stat().st_size:,} bytes")
+    print("-" * 60)
+    the_file = f"Scanning: {file_path}"
+    print(the_file)
+    file_size = f"File size: {file_path.stat().st_size:,} bytes"
+    print(file_size)
+    file_hash = f"sha256 file hash: {calculate_file_hash(file_path)}"
+    print(file_hash)
     print("-" * 60)
     
     # Extract strings
@@ -553,6 +556,9 @@ def main():
     
     if args.output:
         with open(args.output, 'w') as f:
+            f.write(the_file + "\n")
+            f.write(file_size + "\n")
+            f.write(file_hash + "\n")
             f.write(output_text)
         print(f"\n\nResults saved to: {args.output}")
 
