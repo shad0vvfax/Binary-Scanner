@@ -10,6 +10,7 @@ import argparse
 import hashlib
 from pathlib import Path
 from collections import Counter
+from datetime import datetime
 
 # Common suspicious string patterns
 SUSPICIOUS_PATTERNS = {
@@ -44,6 +45,50 @@ SUSPICIOUS_KEYWORDS = [
     'privilege_escalation', 'privesc', 'impersonate_token',
     'invoke-mimikatz', 'invoke-bloodhound', 'powersploit'
 ]
+
+# SSH-related suspicious patterns
+SSH_PATTERNS = {
+    'SSH Private Keys': [
+        b'-----BEGIN RSA PRIVATE KEY-----',
+        b'-----BEGIN DSA PRIVATE KEY-----',
+        b'-----BEGIN EC PRIVATE KEY-----',
+        b'-----BEGIN OPENSSH PRIVATE KEY-----',
+        b'-----BEGIN PRIVATE KEY-----',
+        b'-----BEGIN ENCRYPTED PRIVATE KEY-----'
+    ],
+    'SSH Commands': [
+        b'ssh -o StrictHostKeyChecking=no',
+        b'ssh -o UserKnownHostsFile=/dev/null',
+        b'ssh -i /root/.ssh/',
+        b'ssh -N -D',  # SOCKS proxy
+        b'ssh -L',  # Local port forwarding
+        b'ssh -R',  # Remote port forwarding
+        b'ssh-keygen -f',
+        b'chmod 600 ~/.ssh/',
+        b'eval `ssh-agent',
+        b'ssh-add -'
+    ],
+    'SSH Config Abuse': [
+        b'~/.ssh/authorized_keys',
+        b'/root/.ssh/authorized_keys',
+        b'echo ssh-rsa',
+        b'>> ~/.ssh/authorized_keys',
+        b'PasswordAuthentication no',
+        b'PubkeyAuthentication yes',
+        b'PermitRootLogin yes',
+        b'StrictHostKeyChecking no'
+    ],
+    'SSH Tunneling': [
+        b'ProxyCommand',
+        b'DynamicForward',
+        b'LocalForward',
+        b'RemoteForward',
+        b'ProxyJump',
+        b'-D 127.0.0.1:',
+        b'-L 127.0.0.1:',
+        b'-R 127.0.0.1:'
+    ]
+}
 
 # Privilege escalation indicators
 PRIVESC_PATTERNS = {
@@ -399,37 +444,74 @@ def detect_privilege_escalation(file_path):
     
     return findings
 
-def calculate_file_hash(file_path, algorithm='sha256', buffer_size=8192):
-    """
-    Computes the hash of a file using the specified algorithm.
-
-    Args:
-        file_path (str): The path to the file.
-        algorithm (str): The hashing algorithm to use (e.g., 'md5', 'sha1', 'sha256').
-        buffer_size (int): The size of chunks to read the file in (bytes).
-
-    Returns:
-        str: The hexadecimal hash digest of the file, or None if file not found.
-    """
-    # Create a hash object
-    try:
-        hash_func = hashlib.new(algorithm)
-    except ValueError:
-        print(f"Error: Invalid hash algorithm '{algorithm}'")
-        return None
-
-    # Open the file in binary mode for reading
+def detect_ssh_patterns(file_path):
+    """Detect SSH-related patterns that could indicate exploitation."""
+    findings = {}
+    
     try:
         with open(file_path, 'rb') as f:
-            # Read the file in chunks and update the hash object
-            while chunk := f.read(buffer_size):
-                hash_func.update(chunk)
+            data = f.read()
         
-        # Return the hexadecimal representation of the digest
-        return hash_func.hexdigest()
-    except FileNotFoundError:
-        print(f"Error: File not found at '{file_path}'")
-        return None
+        for category, patterns in SSH_PATTERNS.items():
+            matches = []
+            for pattern in patterns:
+                if pattern in data:
+                    count = data.count(pattern)
+                    pattern_str = pattern.decode('ascii', errors='ignore')
+                    
+                    # Get context for better analysis
+                    idx = data.find(pattern)
+                    start = max(0, idx - 30)
+                    end = min(len(data), idx + len(pattern) + 30)
+                    context = data[start:end]
+                    context_str = ''.join(c if 32 <= ord(c) < 127 else '.' 
+                                        for c in context.decode('ascii', errors='ignore'))
+                    
+                    if len(context_str) > 80:
+                        context_str = context_str[:40] + '...' + context_str[-37:]
+                    
+                    matches.append(f"{pattern_str} [{count}x]")
+            
+            if matches:
+                findings[category] = matches
+        
+    except Exception as e:
+        print(f"Error during SSH pattern detection: {e}", file=sys.stderr)
+    
+    return findings
+
+def calculate_file_hashes(file_path):
+    """Calculate MD5, SHA1, and SHA256 hashes of the file."""
+    hashes = {}
+    
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        
+        hashes['MD5'] = hashlib.md5(data).hexdigest()
+        hashes['SHA1'] = hashlib.sha1(data).hexdigest()
+        hashes['SHA256'] = hashlib.sha256(data).hexdigest()
+        
+    except Exception as e:
+        print(f"Error calculating hashes: {e}", file=sys.stderr)
+    
+    return hashes
+
+def get_file_metadata(file_path):
+    """Get file metadata including timestamps and size."""
+    metadata = {}
+    
+    try:
+        stat = file_path.stat()
+        metadata['File Size'] = f"{stat.st_size:,} bytes ({stat.st_size / (1024*1024):.2f} MB)"
+        metadata['Created'] = datetime.fromtimestamp(stat.st_ctime).strftime('%Y-%m-%d %H:%M:%S')
+        metadata['Modified'] = datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+        metadata['Accessed'] = datetime.fromtimestamp(stat.st_atime).strftime('%Y-%m-%d %H:%M:%S')
+        
+    except Exception as e:
+        print(f"Error getting metadata: {e}", file=sys.stderr)
+    
+    return metadata
 
 def main():
     parser = argparse.ArgumentParser(
@@ -453,14 +535,22 @@ def main():
         print(f"Error: File '{args.file}' not found", file=sys.stderr)
         sys.exit(1)
     
-    print("-" * 60)
-    the_file = f"Scanning: {file_path}"
-    print(the_file)
-    file_size = f"File size: {file_path.stat().st_size:,} bytes"
-    print(file_size)
-    file_hash = f"sha256 file hash: {calculate_file_hash(file_path)}"
-    print(file_hash)
-    print("-" * 60)
+    # Calculate hashes and get metadata
+    print("=" * 60)
+    print("FILE ANALYSIS")
+    print("=" * 60)
+    print(f"File: {file_path.name}")
+    print(f"Path: {file_path.absolute()}")
+    
+    metadata = get_file_metadata(file_path)
+    print(f"Size: {metadata.get('File Size', 'Unknown')}")
+    
+    print("\nCalculating file hashes...")
+    hashes = calculate_file_hashes(file_path)
+    
+    print("\n" + "=" * 60)
+    print("SCANNING FOR SUSPICIOUS PATTERNS")
+    print("=" * 60)
     
     # Extract strings
     all_strings = []
@@ -516,8 +606,33 @@ def main():
     print("Checking for privilege escalation indicators...")
     privesc_findings = detect_privilege_escalation(file_path)
     
-    # Display results
+    # Detect SSH patterns
+    print("Checking for SSH-related patterns...")
+    ssh_findings = detect_ssh_patterns(file_path)
+    
+    # Build output
     output_lines = []
+    
+    # Add header with file info
+    output_lines.append("=" * 60)
+    output_lines.append("FILE ANALYSIS REPORT")
+    output_lines.append("=" * 60)
+    output_lines.append(f"\nFile: {file_path.name}")
+    output_lines.append(f"Path: {file_path.absolute()}")
+    output_lines.append(f"\nFile Size: {metadata.get('File Size', 'Unknown')}")
+    output_lines.append(f"Created:  {metadata.get('Created', 'Unknown')}")
+    output_lines.append(f"Modified: {metadata.get('Modified', 'Unknown')}")
+    output_lines.append(f"Accessed: {metadata.get('Accessed', 'Unknown')}")
+    output_lines.append(f"\nMD5:    {hashes.get('MD5', 'N/A')}")
+    output_lines.append(f"SHA1:   {hashes.get('SHA1', 'N/A')}")
+    output_lines.append(f"SHA256: {hashes.get('SHA256', 'N/A')}")
+    output_lines.append(f"\nStrings Extracted: {len(all_strings)}")
+    output_lines.append("\n" + "=" * 60)
+    output_lines.append("FINDINGS")
+    output_lines.append("=" * 60)
+    
+    # Display results
+    has_findings = False
     
     if pattern_findings:
         output_lines.append("=== SUSPICIOUS PATTERNS FOUND ===\n")
@@ -552,15 +667,17 @@ def main():
     
     # Output results
     output_text = "\n".join(output_lines)
-    print(output_text)
+    print("\n" + output_text)
     
     if args.output:
-        with open(args.output, 'w') as f:
-            f.write(the_file + "\n")
-            f.write(file_size + "\n")
-            f.write(file_hash + "\n")
-            f.write(output_text)
-        print(f"\n\nResults saved to: {args.output}")
+        try:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(output_text)
+            print(f"\n{'=' * 60}")
+            print(f"✓ Full report (with hashes) saved to: {args.output}")
+            print("=" * 60)
+        except Exception as e:
+            print(f"\nError saving report: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
